@@ -6,6 +6,7 @@ pub mod build;
 pub mod check;
 pub mod completion;
 pub mod docs;
+pub mod export_ast;
 pub mod fmt;
 pub mod lsp;
 pub mod new;
@@ -29,6 +30,9 @@ pub enum Cmd {
     Check(check::Args),
     Docs(docs::Args),
     Add(packages::add::Args),
+    
+    #[clap(visible_alias("export"))]
+    ExportAst(export_ast::Args),
 
     #[clap(subcommand)]
     Blueprint(blueprint::Cmd),
