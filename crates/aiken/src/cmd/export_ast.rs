@@ -39,6 +39,8 @@ struct SerializableDefinition {
     data_constructors: Option<Vec<SerializableConstructor>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<SerializableExpression>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    module_imports: Option<SerializableImport>,
     location: SerializableSpan,
     doc_comments: Option<Vec<String>>,
 }
@@ -129,6 +131,24 @@ enum SerializablePatternValue {
         #[serde(skip_serializing_if = "Option::is_none")]
         tail: Option<Box<SerializablePatternValue>> 
     },
+}
+
+// Add a new serializable structure for imports
+#[derive(Serialize)]
+struct SerializableImport {
+    module_path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    as_name: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unqualified_imports: Vec<SerializableUnqualifiedImport>,
+}
+
+#[derive(Serialize)]
+struct SerializableUnqualifiedImport {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    as_name: Option<String>,
+    location: SerializableSpan,
 }
 
 pub fn exec(
@@ -257,6 +277,7 @@ fn convert_to_serializable_module(ast: &aiken_lang::ast::UntypedModule, file_pat
                     function_args: Some(args),
                     data_constructors: None,
                     body,
+                    module_imports: None,
                     location: SerializableSpan {
                         start: function.location.start,
                         end: function.location.end,
@@ -293,6 +314,7 @@ fn convert_to_serializable_module(ast: &aiken_lang::ast::UntypedModule, file_pat
                     function_args: None,
                     data_constructors: Some(constructors),
                     body: None,
+                    module_imports: None,
                     location: SerializableSpan {
                         start: data_type.location.start,
                         end: data_type.location.end,
@@ -335,6 +357,7 @@ fn convert_to_serializable_module(ast: &aiken_lang::ast::UntypedModule, file_pat
                     function_args: Some(args),
                     data_constructors: None,
                     body,
+                    module_imports: None,
                     location: SerializableSpan {
                         start: validator.location.start,
                         end: validator.location.end,
@@ -342,9 +365,127 @@ fn convert_to_serializable_module(ast: &aiken_lang::ast::UntypedModule, file_pat
                     doc_comments: docs,
                 });
             },
-            // Add other definition types as needed
+            aiken_lang::ast::Definition::Use(use_stmt) => {
+                // Extract information about the import
+                let unqualified_imports = use_stmt.unqualified.iter()
+                    .map(|import| SerializableUnqualifiedImport {
+                        name: import.name.clone(),
+                        as_name: import.as_name.clone(),
+                        location: SerializableSpan {
+                            start: import.location.start,
+                            end: import.location.end,
+                        },
+                    })
+                    .collect();
+                
+                let module_name = use_stmt.module.join("/");
+                
+                definitions.push(SerializableDefinition {
+                    kind: "Use".to_string(),
+                    name: module_name,
+                    function_args: None,
+                    data_constructors: None,
+                    body: None,
+                    module_imports: Some(SerializableImport {
+                        module_path: use_stmt.module.clone(),
+                        as_name: use_stmt.as_name.clone(),
+                        unqualified_imports,
+                    }),
+                    location: SerializableSpan {
+                        start: use_stmt.location.start,
+                        end: use_stmt.location.end,
+                    },
+                    doc_comments: None,
+                });
+            },
+            // Handle other types of definitions
+            aiken_lang::ast::Definition::TypeAlias(type_alias) => {
+                // Extract the annotation
+                let annotation = serialize_annotation(&type_alias.annotation);
+                
+                // Extract type alias doc comments
+                let docs = type_alias.doc.as_ref().map(|doc| vec![doc.clone()]);
+                
+                definitions.push(SerializableDefinition {
+                    kind: "TypeAlias".to_string(),
+                    name: type_alias.alias.clone(),
+                    function_args: None,
+                    data_constructors: None,
+                    body: None,
+                    module_imports: None,
+                    location: SerializableSpan {
+                        start: type_alias.location.start,
+                        end: type_alias.location.end,
+                    },
+                    doc_comments: docs,
+                });
+            },
+            aiken_lang::ast::Definition::ModuleConstant(constant) => {
+                // Extract constant annotations if present
+                let annotation = constant.annotation.as_ref().map(serialize_annotation);
+                
+                // Extract constant doc comments
+                let docs = constant.doc.as_ref().map(|doc| vec![doc.clone()]);
+                
+                definitions.push(SerializableDefinition {
+                    kind: "Constant".to_string(),
+                    name: constant.name.clone(),
+                    function_args: None,
+                    data_constructors: None,
+                    body: None,
+                    module_imports: None,
+                    location: SerializableSpan {
+                        start: constant.location.start,
+                        end: constant.location.end,
+                    },
+                    doc_comments: docs,
+                });
+            },
+            aiken_lang::ast::Definition::Test(test_function) => {
+                // Extract test function arguments with type annotations
+                let args = test_function.arguments.iter()
+                    .map(|arg| {
+                        let arg_name = match &arg.arg_name {
+                            aiken_lang::ast::ArgName::Named { name, .. } => name.clone(),
+                            _ => "_".to_string(),
+                        };
+                        
+                        // Convert the annotation to structured form if present
+                        let annotation = arg.annotation.as_ref().map(serialize_annotation);
+                        
+                        SerializableArgument {
+                            name: arg_name,
+                            annotation,
+                        }
+                    })
+                    .collect();
+                
+                // Extract test body if detailed mode is enabled
+                let body = if detailed {
+                    Some(serialize_expression(&test_function.body))
+                } else {
+                    None
+                };
+                
+                // Extract test doc comments
+                let docs = test_function.doc.as_ref().map(|doc| vec![doc.clone()]);
+                
+                definitions.push(SerializableDefinition {
+                    kind: "Test".to_string(),
+                    name: test_function.name.clone(),
+                    function_args: Some(args),
+                    data_constructors: None,
+                    body,
+                    module_imports: None,
+                    location: SerializableSpan {
+                        start: test_function.location.start,
+                        end: test_function.location.end,
+                    },
+                    doc_comments: docs,
+                });
+            },
             _ => {
-                // Skip other definition types for now
+                // Skip other definition types
             }
         }
     }
@@ -977,37 +1118,40 @@ fn serialize_annotation(annotation: &aiken_lang::ast::Annotation) -> Serializabl
 
 fn export_project_files(project_dir: &PathBuf, output_dir: &PathBuf, detailed: bool) -> Result<()> {
     // Find all Aiken files in the project
-    let aiken_files = find_aiken_files(project_dir)?;
+    let files = find_aiken_files(project_dir)?;
     
-    for file_path in aiken_files {
-        export_file(&file_path, output_dir, detailed)?;
+    // Export each file independently
+    for file in files {
+        export_file(&file, output_dir, detailed)?;
     }
     
     Ok(())
 }
 
 fn find_aiken_files(dir: &PathBuf) -> Result<Vec<PathBuf>> {
-    let mut aiken_files = Vec::new();
-    
-    let entries = fs::read_dir(dir).map_err(|e| {
-        miette::Error::msg(format!("Failed to read directory {}: {}", dir.display(), e))
-    })?;
-    
-    for entry in entries {
-        if let Ok(entry) = entry {
+    let mut files = Vec::new();
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir).map_err(|e| {
+            miette::Error::msg(format!("Failed to read directory {}: {}", dir.display(), e))
+        })? {
+            let entry = entry.map_err(|e| {
+                miette::Error::msg(format!("Failed to read directory entry: {}", e))
+            })?;
             let path = entry.path();
             if path.is_dir() {
-                // Skip target directory
-                if path.file_name().map_or(false, |name| name == "target") {
-                    continue;
+                // Skip .git and similar hidden directories
+                if let Some(name) = path.file_name() {
+                    if name.to_string_lossy().starts_with('.') {
+                        continue;
+                    }
                 }
+                // Recursively find files in subdirectories
                 let mut subdir_files = find_aiken_files(&path)?;
-                aiken_files.append(&mut subdir_files);
-            } else if path.extension().map_or(false, |ext| ext == "ak") {
-                aiken_files.push(path);
+                files.append(&mut subdir_files);
+            } else if path.is_file() && path.extension().map_or(false, |ext| ext == "ak") {
+                files.push(path);
             }
         }
     }
-    
-    Ok(aiken_files)
+    Ok(files)
 } 
