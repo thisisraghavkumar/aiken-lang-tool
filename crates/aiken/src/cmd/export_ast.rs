@@ -672,9 +672,15 @@ fn serialize_expression(expr: &UntypedExpr) -> SerializableExpression {
             
             // Add clauses as sub-expressions
             for clause in clauses {
+                // Create a proper serialization of patterns
+                let mut patterns_array = Vec::new();
+                for pattern in clause.patterns.iter() {
+                    patterns_array.push(serde_json::to_value(serialize_pattern(pattern)).unwrap());
+                }
+                
                 let pattern_expr = SerializableExpression {
                     kind: "Pattern".to_string(),
-                    value: Some(serde_json::Value::String(format!("{:?}", clause.patterns))),
+                    value: Some(serde_json::Value::Array(patterns_array)),
                     sub_expressions: Vec::new(),
                     location: SerializableSpan {
                         start: clause.location.start,

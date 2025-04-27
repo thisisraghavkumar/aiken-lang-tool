@@ -3,7 +3,7 @@ use cmd::{
     blueprint::{self, address},
     build, check, completion, docs, export_ast, fmt, lsp, new,
     packages::{self, add},
-    tx, uplc, Cmd,
+    tx, uplc, analyze_validator, Cmd,
 };
 use owo_colors::OwoColorize;
 
@@ -27,6 +27,7 @@ fn main() -> miette::Result<()> {
         Cmd::Tx(sub_cmd) => tx::exec(sub_cmd),
         Cmd::Uplc(sub_cmd) => uplc::exec(sub_cmd),
         Cmd::Completion(sub_cmd) => completion::exec(sub_cmd),
+        Cmd::AnalyzeValidator(args) => analyze_validator::exec(args),
     }
 }
 

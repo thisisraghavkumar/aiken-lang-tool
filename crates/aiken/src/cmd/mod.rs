@@ -13,6 +13,7 @@ pub mod new;
 pub mod packages;
 pub mod tx;
 pub mod uplc;
+pub mod analyze_validator; 
 
 /// Aiken: a smart-contract language and toolchain for Cardano
 #[derive(Parser)]
@@ -51,6 +52,8 @@ pub enum Cmd {
 
     #[clap(hide = true)]
     Lsp(lsp::Args),
+
+    AnalyzeValidator(analyze_validator::Args),
 }
 
 impl Default for Cmd {
