@@ -1,5 +1,5 @@
 use aiken_lang::{
-    ast::{Definition, ModuleKind, Tracing, TypedValidator, Function, Arg, Span, AssignmentKind},
+    ast::{Definition, ModuleKind, Tracing, TypedValidator, Function, Arg, Span, AssignmentKind, BinOp},
     expr::TypedExpr,
     tipo::Type,
 };
@@ -20,6 +20,7 @@ pub struct Args {
 // Types of security patterns we're looking for
 #[derive(Debug, Clone, PartialEq)]
 enum SecurityPatternKind {
+    InputTokenCountComparison,
     DuplicateInputCheck,
     // Other security patterns could be added here
 }
@@ -54,6 +55,8 @@ enum ValueOrigin {
     OutputReference,
     // Other origin not directly related to script context
     Other(String),
+    // Count of tokens in a list
+    TokenCount,
     // Unknown origin
     Unknown,
 }
@@ -134,6 +137,7 @@ impl Display for SymbolicValue {
             ValueOrigin::InputTokenAddress => write!(f, "InputTokenAddress")?,
             ValueOrigin::Purpose => write!(f, "Purpose")?,
             ValueOrigin::OutputReference => write!(f, "OutputReference")?,
+            ValueOrigin::TokenCount => write!(f, "TokenCount")?,
             ValueOrigin::Other(s) => write!(f, "Other({})", s)?,
             ValueOrigin::Unknown => write!(f, "Unknown")?,
         }
@@ -164,6 +168,7 @@ impl Display for SymbolicValue {
                     ValueOrigin::InputTokenAddress => write!(f, "InputTokenAddress")?,
                     ValueOrigin::Purpose => write!(f, "Purpose")?,
                     ValueOrigin::OutputReference => write!(f, "OutputReference")?,
+                    ValueOrigin::TokenCount => write!(f, "TokenCount")?,
                     ValueOrigin::Other(s) => write!(f, "Other({})", s)?,
                     ValueOrigin::Unknown => write!(f, "Unknown")?,
                 }
@@ -610,6 +615,9 @@ impl AstAnalyzer {
         println!("\nPerforming static analysis focusing on ScriptContext.purpose and transaction.inputs tracking...");
         println!("Found {} validators to analyze", self.validators.len());
         
+        // Create a vector to store validation results for the summary
+        let mut validation_results = Vec::new();
+        
         // Process each validator
         for validator in &self.validators {
             println!("\nAnalyzing validator: {}", validator.fun.name);
@@ -712,6 +720,79 @@ impl AstAnalyzer {
                     println!("  - Expression{}", location);
                 }
             }
+            
+            // Check for InputTokenCountComparison findings
+            println!("\nSecurity Check - Token Count Validation:");
+            let has_token_count_check = execution_result.findings.iter().any(|finding| 
+                finding.kind == SecurityPatternKind::InputTokenCountComparison
+            );
+            
+            if has_token_count_check {
+                println!("\x1b[32m✓ PASSED: Token count validation detected\x1b[0m");
+                for finding in execution_result.findings.iter().filter(|f| f.kind == SecurityPatternKind::InputTokenCountComparison) {
+                    println!("  - Found at line {}: {}", finding.location.start, finding.description);
+                }
+            } else {
+                println!("\x1b[31m✗ ALERT: No token count validation detected - your validator may be vulnerable to double satisfaction attacks\x1b[0m");
+                println!("  - Recommendation: Add validation that checks the count of inputs matching specific criteria");
+            }
+            
+            // Check for DuplicateInputCheck findings
+            let has_duplicate_check = execution_result.findings.iter().any(|finding| 
+                finding.kind == SecurityPatternKind::DuplicateInputCheck
+            );
+            
+            // Store validation results for summary
+            validation_results.push((
+                validator.fun.name.clone(),
+                has_token_count_check,
+                has_duplicate_check
+            ));
+        }
+        
+        // Print summary table of validation results
+        println!("\n\n=================================================================");
+        println!("                     SECURITY ANALYSIS SUMMARY                   ");
+        println!("=================================================================");
+        println!("| {:<30} | {:<20} | {:<20} |", "Validator", "Token Count Check", "Duplicate Input Check");
+        println!("|--------------------------------|----------------------|----------------------|");
+        
+        for (validator_name, has_token_count, has_duplicate) in &validation_results {
+            let token_count_status = if *has_token_count {
+                "\x1b[32m✓ PASSED\x1b[0m"
+            } else {
+                "\x1b[31m✗ FAILED\x1b[0m"
+            };
+            
+            let duplicate_check_status = if *has_duplicate {
+                "\x1b[32m✓ PASSED\x1b[0m"
+            } else {
+                "\x1b[31m✗ FAILED\x1b[0m"
+            };
+            
+            println!("| {:<30} | {:<20} | {:<20} |", validator_name, token_count_status, duplicate_check_status);
+        }
+        
+        println!("=================================================================");
+        
+        // Print recommendations based on summary
+        let any_token_count_failed = validation_results.iter().any(|(_, has_token, _)| !has_token);
+        let any_duplicate_failed = validation_results.iter().any(|(_, _, has_duplicate)| !has_duplicate);
+        
+        if any_token_count_failed || any_duplicate_failed {
+            println!("\nRECOMMENDATIONS:");
+            
+            if any_token_count_failed {
+                println!("\x1b[31m- Implement token count validation in validators that lack it\x1b[0m");
+                println!("  This prevents double satisfaction attacks where the same token is used multiple times");
+            }
+            
+            if any_duplicate_failed {
+                println!("\x1b[31m- Add duplicate input checks in validators that lack them\x1b[0m");
+                println!("  This ensures the same UTXO cannot be used multiple times in a transaction");
+            }
+        } else {
+            println!("\n\x1b[32mAll validators have implemented the recommended security checks.\x1b[0m");
         }
     }
     
@@ -769,7 +850,10 @@ impl AstAnalyzer {
                 false
             },
             
-            TypedExpr::BinOp { name, left, right, .. } => {
+            TypedExpr::BinOp { name, left, right, .. } if matches!(name, 
+                BinOp::Eq | BinOp::NotEq | BinOp::LtInt | 
+                BinOp::LtEqInt | BinOp::GtEqInt | BinOp::GtInt) => {
+                
                 // Check if this binary operation is comparing addresses
                 if self.is_address_comparison(name, left, right) {
                     return true;
@@ -1043,9 +1127,26 @@ impl AstAnalyzer {
                         }
                     },
                     
+                    ValueOrigin::InputToken => {
+                        // Field access on InputToken - looking for OutputReference in Spend
+                        match label.as_str() {
+                            "output_reference" => ValueOrigin::OutputReference,
+                            "output" => ValueOrigin::InputTokenOutput,
+                            _ => ValueOrigin::Other(format!("InputToken.{}", label)),
+                        }
+                    },
+
+                    ValueOrigin::InputTokenOutput => {
+                        // Field access on InputTokenOutput - looking for OutputReference in Spend
+                        match label.as_str() {
+                            "address" => ValueOrigin::InputTokenAddress,
+                            _ => ValueOrigin::Other(format!("InputTokenOutput.{}", label)),
+                        }
+                    },
+
                     _ => {
                         // Other field access, track derivation
-                        ValueOrigin::Other(format!("{:?}.{}", record_value.origin, label))
+                        ValueOrigin::Other(format!("{}", label.as_str()))
                     }
                 };
                 
@@ -1190,6 +1291,63 @@ impl AstAnalyzer {
                                     }else{
                                         println!("ERROR: Expected right hand side to be Transaction, but got {}", value_result.value);
                                     }
+                                } else if constructor_name == "Input"{
+                                    if value_result.value.origin == ValueOrigin::InputToken {
+                                        for arg in arguments {
+                                            if let Some(label) = &arg.label {
+                                                if label == "output_reference" {
+                                                    if let aiken_lang::ast::Pattern::Var { name: output_reference_var, .. } = &arg.value {
+                                                        println!("{}[Level {}] FOUND: Destructured output_reference from InputToken to: {}", 
+                                                                 indent, current_level, output_reference_var);
+                                                        let output_reference_type = value.tipo();
+                                                        let output_reference_value = SymbolicValue::derived(
+                                                            ValueOrigin::OutputReference,
+                                                            output_reference_type,
+                                                            vec![ValueOrigin::ScriptContext,ValueOrigin::Transaction,ValueOrigin::InputToken]
+                                                        );
+                                                        new_env.add_variable(output_reference_var.clone(), output_reference_value);
+                                                    }
+                                                }
+                                                if label == "output" {
+                                                    if let aiken_lang::ast::Pattern::Var { name: output_var, .. } = &arg.value {
+                                                        println!("{}[Level {}] FOUND: Destructured output from InputToken to: {}", 
+                                                                 indent, current_level, output_var);
+                                                        let output_type = value.tipo();
+                                                        let output_value = SymbolicValue::derived(
+                                                            ValueOrigin::InputTokenOutput,
+                                                            output_type,
+                                                            vec![ValueOrigin::ScriptContext,ValueOrigin::Transaction,ValueOrigin::InputToken]
+                                                        );
+                                                        new_env.add_variable(output_var.clone(), output_value); 
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        println!("ERROR: Expected right hand side to be InputToken, but got {}", value_result.value);
+                                    }
+                                } else if constructor_name == "Output"{
+                                    if value_result.value.origin == ValueOrigin::InputTokenOutput {
+                                        for arg in arguments {
+                                            if let Some(label) = &arg.label {
+                                                if label == "address" {
+                                                    if let aiken_lang::ast::Pattern::Var { name: address_var, .. } = &arg.value {
+                                                        println!("{}[Level {}] FOUND: Destructured address from InputTokenOutput to: {}", 
+                                                                 indent, current_level, address_var);
+                                                        let address_type = value.tipo();    
+                                                        let address_value = SymbolicValue::derived(
+                                                            ValueOrigin::InputTokenAddress,
+                                                            address_type,
+                                                            vec![ValueOrigin::ScriptContext,ValueOrigin::Transaction,ValueOrigin::InputToken,ValueOrigin::InputTokenOutput]
+                                                        );
+                                                        new_env.add_variable(address_var.clone(), address_value);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }else{
+                                        println!("ERROR: Expected right hand side to be InputTokenOutput, but got {}", value_result.value);
+                                    }
                                 } else {
                                     println!("DEBUG: Destructuring only implemented for ScriptContext or Transaction, but got {}", value_result.value);
                                 }
@@ -1201,8 +1359,10 @@ impl AstAnalyzer {
                         }
                     },
                     AssignmentKind::Expect => {
+                        println!("DEBUG: Expect assignment");
                         match pattern {
                             aiken_lang::ast::Pattern::Constructor { name: constructor_name, arguments, .. } => {
+                                println!("DEBUG: Expect assignment constructor: {}", constructor_name);
                                 if constructor_name == "Spend" {
                                     println!("{}[Level {}] Found pattern match: expect Spend(...) = ...", 
                                             indent, current_level);
@@ -1365,7 +1525,7 @@ impl AstAnalyzer {
                     TypedExpr::ModuleSelect { module_name, label, .. } => format!("{}::{}", module_name, label),
                     _ => "anonymous function".to_string()
                 };
-                
+                println!("{}Calling Function name: {}", indent, function_name);
                 // Check if this is from aiken/list module
                 let is_list_module_function = match &**fun {
                     // Handle module-select expressions like module.function
@@ -1423,6 +1583,92 @@ impl AstAnalyzer {
                                 val_origin = ValueOrigin::InputToken;
                             } else if is_list_inputs {
                                 val_origin = ValueOrigin::Unknown;
+                            }
+                            let val_value = SymbolicValue::derived(val_origin, expr.tipo(), vec![]);
+                            let result = ExprResult {
+                                value: val_value,
+                                environment: current_env,
+                                findings: all_findings,
+                                uses,
+                                uses_purpose,
+                                uses_inputs,
+                                location: Some(expr.location()),
+                                function_level: fun_result.function_level,
+                            };
+                            return result;
+                        } else if function_name == "aiken/list::map" {
+                            println!("{}Evaluating arguments for list.map", indent);
+                            let list_result = arg_results[0].clone();
+                            let predicate_result = arg_results[1].clone();
+                            let is_list_inputs = list_result.value.origin == ValueOrigin::TransactionInputs;
+                            let is_list_outputs = list_result.value.origin == ValueOrigin::InputTokenOutput;
+                            let does_predicate_use_output = predicate_result.uses.contains(&ValueOrigin::InputTokenOutput);
+                            let does_predicate_use_address = predicate_result.uses.contains(&ValueOrigin::InputTokenAddress);
+                            println!("DEBUG: List.Map {}Value of list: {:#?}", indent, list_result.value);
+                            println!("DEBUG: List.Map {}Value of predicate: {:#?}", indent, predicate_result.value);
+                            println!("DEBUG: List.Map {}does_predicate_use_address: {}", indent, does_predicate_use_address);
+                            let mut val_origin = ValueOrigin::Unknown;
+                            if is_list_inputs && does_predicate_use_address {
+                                val_origin = ValueOrigin::InputTokenAddress;
+                            } else if is_list_inputs && does_predicate_use_output {
+                                val_origin = ValueOrigin::InputTokenOutput;
+                            } else if is_list_inputs {
+                                match predicate_result.value.origin {
+                                    ValueOrigin::Other(s) => {
+                                        if s == "address"{
+                                            val_origin = ValueOrigin::InputTokenAddress;
+                                        } else if s == "output_reference"{
+                                            val_origin = ValueOrigin::OutputReference;
+                                        } else if s == "output"{
+                                            val_origin = ValueOrigin::InputTokenOutput;
+                                        } else if s == "inputs"{
+                                            val_origin = ValueOrigin::TransactionInputs;
+                                        }
+                                    }
+                                    _ => val_origin = val_origin,
+                                }
+                            } else if is_list_outputs {
+                                match predicate_result.value.origin {
+                                    ValueOrigin::Other(s) => {
+                                        if s == "address"{
+                                            val_origin = ValueOrigin::InputTokenAddress;
+                                        }
+                                    },
+                                    _ => val_origin = val_origin,
+                                }
+                            }
+                            let val_value = SymbolicValue::derived(val_origin, expr.tipo(), vec![]);
+                            let result = ExprResult {
+                                value: val_value,
+                                environment: current_env,
+                                findings: all_findings,
+                                uses,
+                                uses_purpose,
+                                uses_inputs,
+                                location: Some(expr.location()),
+                                function_level: fun_result.function_level,
+                            };
+                            return result;
+                        } else if function_name == "aiken/list::count" {
+                            println!("{}Evaluating arguments for list.count", indent);
+                            let list_result = arg_results[0].clone();
+                            let predicate_result = arg_results[1].clone();
+                            let is_list_inputs = list_result.value.origin == ValueOrigin::TransactionInputs;
+                            let is_list_outputs = list_result.value.origin == ValueOrigin::InputTokenOutput;
+                            let is_list_addresses = list_result.value.origin == ValueOrigin::InputTokenAddress;
+                            let does_predicate_use_address = predicate_result.uses.contains(&ValueOrigin::InputTokenAddress);
+                            let mut val_origin = ValueOrigin::Unknown;
+                            if is_list_inputs && does_predicate_use_address {
+                                val_origin = ValueOrigin::TokenCount;
+                            } else {
+                                match predicate_result.value.origin {
+                                    ValueOrigin::Other(s) => {
+                                        if s == "address"{
+                                            val_origin = ValueOrigin::TokenCount;
+                                        }
+                                    }
+                                    _ => val_origin = val_origin,
+                                }
                             }
                             let val_value = SymbolicValue::derived(val_origin, expr.tipo(), vec![]);
                             let result = ExprResult {
@@ -1526,6 +1772,161 @@ impl AstAnalyzer {
                     uses_inputs: body_result.uses_inputs,
                     location: Some(expr.location()),
                     function_level: body_result.function_level,
+                }
+            },
+            TypedExpr::BinOp { name, left, right, .. } => {
+                let left_result = self.execute_expression(left, env);
+                let right_result = self.execute_expression(right, env);
+                let mut new_env = right_result.environment;
+                
+                // Combine findings and uses from both sides
+                let mut findings = Vec::new();
+                findings.extend(left_result.findings);
+                findings.extend(right_result.findings);
+                
+                let mut uses = left_result.uses.clone();
+                uses.extend(right_result.uses);
+                
+                // Create a symbolic value for the result
+                let value = right_result.value.clone();
+
+                // Log special cases
+                if matches!(name, 
+                    BinOp::Eq | BinOp::NotEq | BinOp::LtInt | 
+                    BinOp::LtEqInt | BinOp::GtEqInt | BinOp::GtInt) {
+                    let left_val = left_result.value.origin;
+                    let right_val = right_result.value.origin;
+                    let is_left_token_count = left_val == ValueOrigin::TokenCount;
+                    let is_right_token_count = right_val == ValueOrigin::TokenCount;
+                    if is_left_token_count || is_right_token_count {
+                        println!("DEBUG: Token count comparison detected with operator {:?}", name);
+                        findings.push(SecurityFinding{
+                            description: "Token count comparison detected".to_string(),
+                            location: expr.location(),
+                            kind: SecurityPatternKind::InputTokenCountComparison,
+                            confidence: 80,
+                        });
+                    }
+                }
+                
+                ExprResult {
+                    value,
+                    environment: new_env,
+                    findings,
+                    uses,
+                    uses_purpose: left_result.uses_purpose || right_result.uses_purpose,
+                    uses_inputs: left_result.uses_inputs || right_result.uses_inputs,
+                    location: Some(expr.location()),
+                    function_level: left_result.function_level,
+                }
+            },
+            TypedExpr::When { subject, clauses, .. } => {
+                println!("{}[Level {}] Executing When expression", indent, current_level);
+                
+                // First, evaluate the subject expression
+                let subject_result = self.execute_expression(subject, env);
+                let mut new_env = subject_result.environment;
+                let mut all_findings = subject_result.findings;
+                let mut uses_purpose = subject_result.uses_purpose;
+                let mut uses_inputs = subject_result.uses_inputs;
+                let mut uses = subject_result.uses.clone();
+                // Track results from all clauses
+                let mut clause_results = Vec::new();
+                
+                // Evaluate each clause's body
+                // Note: We're simplifying here - in a real symbolic execution, we would
+                // check which patterns match and only execute the matching clauses
+                for clause in clauses {
+                    println!("{}[Level {}] Executing clause", indent, current_level);
+                    
+                    // Clone the environment for this clause
+                    let mut clause_env = new_env.clone();
+
+                    // Check for "when purpose is { Spend(oref) => ... }" pattern
+                    if subject_result.value.origin == ValueOrigin::Purpose {
+                        println!("{}[Level {}] Found pattern match on Purpose", indent, current_level);
+                        
+                        if let aiken_lang::ast::Pattern::Constructor { name: constructor_name, arguments, .. } = &clause.pattern {
+                            if constructor_name == "Spend" && arguments.len() == 1 {
+                                println!("{}[Level {}] FOUND: when purpose is {{ Spend(oref) => ... }} pattern", indent, current_level);
+                                
+                                // Extract variable name for the output reference
+                                if let aiken_lang::ast::Pattern::Var { name: var_name, .. } = &arguments[0].value {
+                                    println!("{}[Level {}] Output reference bound to variable: {}", indent, current_level, var_name);
+                                    
+                                    // Create a symbolic value for the output reference
+                                    let oref_value = SymbolicValue::derived(
+                                        ValueOrigin::OutputReference,
+                                        subject.tipo(),
+                                        vec![ValueOrigin::Purpose]
+                                    );
+                                    
+                                    // Register the variable in the environment for this clause
+                                    clause_env.add_variable(var_name.clone(), oref_value);
+                                    
+                                    // Update tracking flags
+                                    uses_purpose = true;
+                                    
+                                    // Add a condition that the purpose is Spend
+                                    clause_env.add_condition(SymbolicCondition::Assertion {
+                                        condition: Box::new(SymbolicCondition::Custom {
+                                            description: "Purpose is Spend".to_string(),
+                                            relates_to_inputs: false,
+                                            relates_to_output_ref: true,
+                                            location: clause.pattern.location(),
+                                        }),
+                                        location: clause.pattern.location(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If there's a guard, evaluate it
+                    if let Some(guard) = &clause.guard {
+                        println!("{}[Level {}] Evaluating clause guard", indent, current_level);
+                        
+                        // Check for duplicate input validation in the guard
+                        if self.check_guard_for_duplicate_inputs(guard) {
+                            println!("{}[Level {}] Found duplicate input check in When clause guard", indent, current_level);
+                            all_findings.push(SecurityFinding {
+                                kind: SecurityPatternKind::DuplicateInputCheck,
+                                confidence: 90,
+                                location: guard.location(),
+                                description: "Duplicate input check found in When clause guard".to_string(),
+                            });
+                        }
+                    }
+                    
+                    // Evaluate the clause body
+                    let clause_result = self.execute_expression(&clause.then, &mut clause_env);
+                    clause_results.push(clause_result.clone());
+                    
+                    // Merge flags and findings
+                    all_findings.extend(clause_result.findings);
+                    uses_purpose |= clause_result.uses_purpose;
+                    uses_inputs |= clause_result.uses_inputs;
+                    uses.extend(clause_result.uses.clone());
+                }
+                
+                // Consolidate results: take the last successful clause result's value
+                // In symbolic execution, we would merge the results with a more complex algorithm
+                let value = if let Some(last_result) = clause_results.last() {
+                    last_result.value.clone()
+                } else {
+                    // Default to subject's value if no clauses
+                    subject_result.value.clone()
+                };
+                
+                ExprResult {
+                    value,
+                    environment: new_env,
+                    findings: all_findings,
+                    uses,
+                    uses_purpose,
+                    uses_inputs,
+                    location: Some(expr.location()),
+                    function_level: subject_result.function_level,
                 }
             },
             // For all other expression types, simplify by just traversing sub-expressions
